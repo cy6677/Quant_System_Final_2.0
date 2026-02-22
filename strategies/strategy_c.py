@@ -76,9 +76,11 @@ class StrategyC_BollingerReversion(SwingBase):
         return orders
 
     def check_specific_exits(self, ticker, pos, current_price, date, universe_prices):
+        """✅ 修正：返回 (orders, should_remove) 唔再直接 del self.positions"""
         orders = []
+        should_remove = False
         bb_ma = pos.get("bb_ma")
         if bb_ma is not None and current_price >= bb_ma:
             orders.append(Order(ticker, "MARKET", quantity=-pos["shares"]))
-            del self.positions[ticker]
-        return orders
+            should_remove = True
+        return orders, should_remove
