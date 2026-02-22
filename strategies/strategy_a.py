@@ -21,6 +21,11 @@ class StrategyA_VCPBreakout(BaseStrategy):
         target_r: float = 2.0,
         trail_atr: float = 3.0,
         max_hold_days: int = 30,
+        # ✅ 新增：VCP 多重收縮參數
+        min_contractions: int = 2,
+        contraction_window: int = 60,
+        rs_lookback: int = 252,
+        rs_min_pct: float = 0.70,
         **kwargs,
     ):
         super().__init__(name="StrategyA_VCP")
@@ -39,17 +44,12 @@ class StrategyA_VCPBreakout(BaseStrategy):
         self.trail_atr = trail_atr
         self.max_hold_days = max_hold_days
 
-        # state 只由策略自己用，記錄每個 ticker 嘅額外資訊
-        # 結構：{
-        #   ticker: {
-        #       "entry_date": Timestamp,
-        #       "entry_price": float,
-        #       "stop_loss": float,
-        #       "highest": float,
-        #       "bars": int,
-        #       "partial": bool,
-        #   }
-        # }
+        # ✅ 新增
+        self.min_contractions = min_contractions
+        self.contraction_window = contraction_window
+        self.rs_lookback = rs_lookback
+        self.rs_min_pct = rs_min_pct
+
         self.state: dict = {}
 
     # ------------------------------------------------------------------
@@ -84,6 +84,65 @@ class StrategyA_VCPBreakout(BaseStrategy):
         return True
 
     # ------------------------------------------------------------------
+    # ✅ 新增：多重收縮檢測
+    # ------------------------------------------------------------------
+    def _count_contractions(self, hist: pd.DataFrame) -> int:
+        """
+        計算最近 contraction_window 日內有幾次 ATR 收縮。
+        定義：ATR 連續下降 >= 5 天算一次收縮。
+        """
+        atr = compute_atr(hist, self.atr_short).tail(self.contraction_window)
+        if len(atr) < 10:
+            return 0
+
+        contractions = 0
+        streak = 0
+        for i in range(1, len(atr)):
+            if pd.isna(atr.iloc[i]) or pd.isna(atr.iloc[i - 1]):
+                streak = 0
+                continue
+            if atr.iloc[i] < atr.iloc[i - 1]:
+                streak += 1
+                if streak >= 5:
+                    contractions += 1
+                    streak = 0
+            else:
+                streak = 0
+        return contractions
+
+    # ------------------------------------------------------------------
+    # ✅ 新增：Relative Strength vs SPY
+    # ------------------------------------------------------------------
+    def _calc_rs_rank(
+        self, ticker: str, hist: pd.DataFrame, universe_prices: dict
+    ) -> float:
+        """
+        計算相對 SPY 嘅 RS 排名百分比。
+        返回 0~1，越高越強。
+        """
+        if "SPY" not in universe_prices:
+            return 1.0  # 如果冇 SPY 數據，預設通過
+
+        spy_df = universe_prices["SPY"]
+        if spy_df is None or spy_df.empty:
+            return 1.0
+
+        lookback = self.rs_lookback
+        if len(hist) < lookback or len(spy_df) < lookback:
+            return 1.0
+
+        ticker_ret = (hist["Close"].iloc[-1] / hist["Close"].iloc[-lookback]) - 1
+        spy_close = spy_df["Close"] if "Close" in spy_df.columns else spy_df["close"]
+        spy_ret = (spy_close.iloc[-1] / spy_close.iloc[-lookback]) - 1
+
+        # RS = ticker return / SPY return（唔用 percentile rank 因為需要全 universe）
+        if spy_ret == 0:
+            return 1.0
+        rs_ratio = ticker_ret / abs(spy_ret)
+        # 簡化：如果 ticker 回報比 SPY 高就通過
+        return 1.0 if rs_ratio >= self.rs_min_pct else rs_ratio
+
+    # ------------------------------------------------------------------
     # on_bar：入場 + 出場
     # ------------------------------------------------------------------
     def on_bar(
@@ -98,14 +157,13 @@ class StrategyA_VCPBreakout(BaseStrategy):
 
         # 1) 新入場
         for ticker, df in universe_prices.items():
-            # 已有持倉就唔再開新倉
             if ticker in positions:
                 continue
             if date not in df.index:
                 continue
 
             hist = df.loc[:date]
-            if len(hist) < max(self.atr_long, 120, self.lookback_high) + 5:
+            if len(hist) < max(self.atr_long, 120, self.lookback_high, self.rs_lookback) + 5:
                 continue
 
             if not self._passes_universe_filters(ticker, hist):
@@ -116,6 +174,7 @@ class StrategyA_VCPBreakout(BaseStrategy):
             if pd.isna(atr_short) or pd.isna(atr_long) or atr_long == 0:
                 continue
 
+            # ✅ 改進：基本收縮條件
             contraction_cond = (atr_short / atr_long) <= self.contraction_ratio
 
             atr14 = compute_atr(hist, 14).iloc[-120:]
@@ -124,6 +183,16 @@ class StrategyA_VCPBreakout(BaseStrategy):
                 contraction_cond = contraction_cond or (pct_rank <= 0.2)
 
             if not contraction_cond:
+                continue
+
+            # ✅ 新增：多重收縮檢測
+            n_contractions = self._count_contractions(hist)
+            if n_contractions < self.min_contractions:
+                continue
+
+            # ✅ 新增：RS Rating 過濾
+            rs = self._calc_rs_rank(ticker, hist, universe_prices)
+            if rs < self.rs_min_pct:
                 continue
 
             highest_last = hist["High"].rolling(self.lookback_high).max().iloc[-2]
@@ -148,7 +217,6 @@ class StrategyA_VCPBreakout(BaseStrategy):
             if shares <= 0:
                 continue
 
-            # 記錄 state
             self.state[ticker] = {
                 "entry_date": date,
                 "entry_price": float(entry_price),
@@ -177,7 +245,6 @@ class StrategyA_VCPBreakout(BaseStrategy):
             current_price = float(df.loc[date, "Close"])
             s = self.state.get(ticker)
 
-            # 如果 state 冇，補一個簡單版本
             if s is None:
                 s = {
                     "entry_date": date,
@@ -189,7 +256,6 @@ class StrategyA_VCPBreakout(BaseStrategy):
                 }
                 self.state[ticker] = s
 
-            # 更新 bars / highest
             s["bars"] += 1
             s["highest"] = max(s["highest"], current_price)
 
@@ -203,8 +269,6 @@ class StrategyA_VCPBreakout(BaseStrategy):
             )
             orders.extend(exit_orders)
 
-            # 如果平晒倉，就刪 state
-            # （真正 position 清除喺 backtester 入面做）
             if any(o.quantity == -pos.qty for o in exit_orders if o.ticker == ticker):
                 self.state.pop(ticker, None)
 
@@ -231,7 +295,7 @@ class StrategyA_VCPBreakout(BaseStrategy):
 
         r_multiple = (current_price - entry) / (entry - stop)
 
-        # 1) partial take-profit：到 target_r，沽一半
+        # 1) partial take-profit
         if r_multiple >= self.target_r and not state.get("partial", False):
             half_shares = pos.qty / 2
             if half_shares > 0:
@@ -244,7 +308,7 @@ class StrategyA_VCPBreakout(BaseStrategy):
                 )
                 state["partial"] = True
 
-        # 2) trailing stop：用最高價 - trail_atr * ATR(14)
+        # 2) trailing stop
         hist = universe_prices[ticker].loc[:date]
         if len(hist) >= 20:
             atr = compute_atr(hist, 14).iloc[-1]
@@ -253,7 +317,6 @@ class StrategyA_VCPBreakout(BaseStrategy):
 
         if not pd.isna(atr):
             trail_stop = state["highest"] - self.trail_atr * atr
-            # 同時確保 trail stop 唔低過原始 stop_loss
             trail_stop = max(trail_stop, stop)
 
             if current_price < trail_stop and pos.qty > 0:
@@ -265,7 +328,7 @@ class StrategyA_VCPBreakout(BaseStrategy):
                     )
                 )
 
-        # 3) max holding days：超過 max_hold_days 一律平倉
+        # 3) max holding days
         if state["bars"] >= self.max_hold_days and pos.qty > 0:
             orders.append(
                 Order(
