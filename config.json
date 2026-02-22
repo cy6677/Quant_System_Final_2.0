@@ -1,32 +1,49 @@
 {
-  "paths": {
-    "rawdata": "data/raw",
-    "processeddata": "data/processed",
-    "pricesdir": "data/prices",
-    "cleanuniversefile": "data/clean_universe.csv",
-    "logfile": "logs/backtest.log"
-  },
-  "data": {
-    "price_start_date": "2015-01-01",
-    "price_end_date": "2025-12-31"
-  },
-  "universe": {
-    "usehistorical": false,
-    "extraetfs": [
-      "SPY",
-      "QQQ"
-    ]
-  },
-  "dataquality": {
-    "usecleanuniverse": false
-  },
-  "backtest": {
-    "initialcapital": 100000,
-    "commissionrate": 0.001,
-    "slippage": 0.001,
-    "mincommission": 1.0,
-    "allowfractional": true,
-    "calendarticker": "SPY"
-  },
-  "costmodel": {}
+    "paths": {
+        "raw_data": "data/raw",
+        "processed_data": "data/processed",
+        "prices_dir": "data/prices",
+        "universe_file": "data/universe.csv",
+        "clean_universe_file": "data/clean_universe.csv",
+        "log_file": "logs/system.log"
+    },
+    "universe": {
+        "cache_days": 7,
+        "extra_etfs": ["SPY", "QQQ", "IWM", "DIA"],
+        "use_historical": false,
+        "symbols": []
+    },
+    "download": {
+        "retry": 3,
+        "sleep_between_retries": 2,
+        "request_timeout": 30,
+        "max_workers": 5
+    },
+    "data": {
+        "price": {
+            "start_date": "2015-01-01",
+            "end_date": "2024-12-31"
+        },
+        "fundamentals": {
+            "api_key": "438de359-d321-4ce9-8333-7cdc02afd711",
+            "mapping_file": "data/simfin_mapping.csv"
+        },
+        "macro": {
+            "fred_api_key": "bfb862bc5a50a326c37e497374962f36"
+        }
+    },
+    "backtest": {
+        "initial_capital": 1000000,
+        "commission_rate": 0.001,
+        "slippage": 0.001,
+        "min_commission": 1.0,
+        "calendar_ticker": "SPY",
+        "allow_fractional": true
+    },
+    "cost_model": {},
+    "data_quality": {
+        "max_missing_pct": 0.2,
+        "max_spike_count": 5,
+        "use_clean_universe": true
+    }
 }
