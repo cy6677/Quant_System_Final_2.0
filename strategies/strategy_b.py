@@ -106,7 +106,9 @@ class StrategyB_AVWAPPullback(SwingBase):
         return orders
 
     def check_specific_exits(self, ticker, pos, current_price, date, universe_prices):
+        """✅ 修正：返回 (orders, should_remove) 唔再直接 del self.positions"""
         orders = []
+        should_remove = False
         entry = pos["entry_price"]
         stop = pos["stop_loss"]
 
@@ -114,8 +116,8 @@ class StrategyB_AVWAPPullback(SwingBase):
             r_multiple = (current_price - entry) / (entry - stop)
             if r_multiple >= self.target_r:
                 orders.append(Order(ticker, "MARKET", quantity=-pos["shares"]))
-                del self.positions[ticker]
-                return orders
+                should_remove = True
+                return orders, should_remove
 
         avwap = pos.get("avwap")
         if avwap is not None and ticker in universe_prices:
@@ -124,6 +126,6 @@ class StrategyB_AVWAPPullback(SwingBase):
                 last_two = df["Close"].iloc[-2:]
                 if (last_two < avwap).all():
                     orders.append(Order(ticker, "MARKET", quantity=-pos["shares"]))
-                    del self.positions[ticker]
+                    should_remove = True
 
-        return orders
+        return orders, should_remove
