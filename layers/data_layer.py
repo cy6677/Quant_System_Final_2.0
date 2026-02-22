@@ -12,6 +12,7 @@ from tqdm import tqdm
 
 from config import load_config
 
+
 class UniverseProvider:
     def __init__(self, config=None):
         self.config = config or load_config()
@@ -56,14 +57,21 @@ class UniverseProvider:
                 resp.raise_for_status()
                 tables = pd.read_html(StringIO(resp.text))
                 df = tables[0]
-                sym_col = "Symbol" if "Symbol" in df.columns else df.columns[0]
-                df = df.rename(
-                    columns={
-                        sym_col: "Ticker",
-                        "GICS Sector": "Sector",
-                        "GICS Sub-Industry": "Industry",
-                    }
-                )
+
+                # 穩健地找到 Symbol 欄位
+                symbol_col = None
+                for col in df.columns:
+                    if 'Symbol' in col or 'Ticker' in col:
+                        symbol_col = col
+                        break
+                if symbol_col is None:
+                    symbol_col = df.columns[0]  # 通常第一個是 Symbol
+
+                df = df.rename(columns={
+                    symbol_col: "Ticker",
+                    "GICS Sector": "Sector",
+                    "GICS Sub-Industry": "Industry",
+                })
                 df["Ticker"] = df["Ticker"].apply(self._normalize_ticker)
                 df["Type"] = "Stock"
                 df = df.dropna(subset=["Ticker"]).drop_duplicates(subset=["Ticker"])
@@ -109,11 +117,14 @@ class PriceDownloader:
 
     def _normalize_yf_columns(self, df, ticker):
         if isinstance(df.columns, pd.MultiIndex):
+            # 嘗試取出特定 ticker 的數據
             if ticker in df.columns.get_level_values(1):
                 df = df.xs(ticker, axis=1, level=1)
             else:
+                # 否則取第一層（標準欄位）
                 df.columns = df.columns.get_level_values(0)
-        df.columns = [str(c) for c in df.columns]
+        # 標準化列名為小寫
+        df.columns = [str(c).lower() for c in df.columns]
         return df
 
     def _download_one(self, ticker) -> Tuple[str, pd.DataFrame | None]:
@@ -136,7 +147,7 @@ class PriceDownloader:
                 if df.empty:
                     continue
                 df = self._normalize_yf_columns(df, ticker)
-                required = {"Close", "High", "Low", "Volume"}
+                required = {"close", "high", "low", "volume"}
                 if not required.issubset(set(df.columns)):
                     continue
                 return ticker, df
@@ -151,7 +162,7 @@ class PriceDownloader:
 
         with ThreadPoolExecutor(max_workers=max_workers) as executor:
             for ticker, df in tqdm(executor.map(self._download_one, tickers), total=len(tickers)):
-                if df is None:
+                if df is None or df.empty:
                     failed.append(ticker)
                 else:
                     results[ticker] = df
