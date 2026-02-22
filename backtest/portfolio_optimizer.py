@@ -6,15 +6,6 @@ from typing import Dict, List, Optional, Tuple
 
 
 class portfolio_optimizer:
-    """
-    Portfolio-level weight optimization。
-    支援：
-    1. risk_parity      — 每個資產貢獻相等風險
-    2. mean_variance    — 最大化 Sharpe（Markowitz）
-    3. equal_weight     — 1/N 等權（baseline）
-    4. min_variance     — 最小化波幅
-    """
-
     def __init__(
         self,
         lookback: int = 252,
@@ -49,20 +40,12 @@ class portfolio_optimizer:
         prices_df = pd.concat(price_list, axis=1).dropna()
         return prices_df.pct_change().dropna()
 
-    # --------------------------------------------------
-    # 1. Risk Parity（等風險貢獻）
-    # --------------------------------------------------
-
     def risk_parity(
         self,
         returns_df: pd.DataFrame,
         n_iter: int = 1000,
         tol: float = 1e-8,
     ) -> Dict[str, float]:
-        """
-        Risk Parity: 每個資產貢獻相等的組合風險。
-        用 Cyclical Coordinate Descent 求解。
-        """
         if returns_df.empty:
             return {}
 
@@ -74,38 +57,30 @@ class portfolio_optimizer:
         for _ in range(n_iter):
             w_old = w.copy()
             for i in range(n):
-                # Marginal Risk Contribution
                 sigma_w = cov @ w
-                mrc = sigma_w[i]
-                # 解析解更新（近似）
+                target_rc = (w @ sigma_w) / n
                 a = cov[i, i]
-                b = (cov[i, :] @ w) - cov[i, i] * w[i]
-                # target: w[i] * mrc = budget / n
-                target_rc = (w @ (cov @ w)) / n
+                b = (cov[i, :] @ w) - a * w[i]
                 # Newton step
-                w[i] = max(1e-6, (-b + np.sqrt(b**2 + 4 * a * target_rc)) / (2 * a))
+                disc = b**2 + 4 * a * target_rc
+                if disc < 0:
+                    continue
+                w[i] = (-b + np.sqrt(disc)) / (2 * a)
+                w[i] = max(w[i], 1e-6)
             w = w / w.sum()
             if np.max(np.abs(w - w_old)) < tol:
                 break
 
-        # 應用 weight 上下限
         w = np.clip(w, self.min_weight, self.max_weight)
         w = w / w.sum()
 
         return {tickers[i]: float(w[i]) for i in range(n)}
-
-    # --------------------------------------------------
-    # 2. Mean-Variance（最大化 Sharpe）
-    # --------------------------------------------------
 
     def mean_variance(
         self,
         returns_df: pd.DataFrame,
         n_portfolios: int = 5000,
     ) -> Dict[str, float]:
-        """
-        Monte Carlo 模擬找最大 Sharpe 組合。
-        """
         if returns_df.empty:
             return {}
 
@@ -133,19 +108,11 @@ class portfolio_optimizer:
 
         return {tickers[i]: float(best_w[i]) for i in range(n)}
 
-    # --------------------------------------------------
-    # 3. Equal Weight
-    # --------------------------------------------------
-
     def equal_weight(self, tickers: List[str]) -> Dict[str, float]:
         if not tickers:
             return {}
         w = 1.0 / len(tickers)
         return {t: float(min(w, self.max_weight)) for t in tickers}
-
-    # --------------------------------------------------
-    # 4. Minimum Variance
-    # --------------------------------------------------
 
     def min_variance(
         self,
@@ -173,10 +140,6 @@ class portfolio_optimizer:
                 best_w   = w
 
         return {tickers[i]: float(best_w[i]) for i in range(n)}
-
-    # --------------------------------------------------
-    # 統一入口
-    # --------------------------------------------------
 
     def optimize(
         self,
