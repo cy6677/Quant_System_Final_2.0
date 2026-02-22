@@ -16,7 +16,6 @@ from backtest.universal_backtester import (
 )
 from config import loadconfig
 
-# Optuna import（如未安裝會 fallback 到 random search）
 try:
     import optuna
     optuna.logging.set_verbosity(optuna.logging.WARNING)
@@ -37,9 +36,9 @@ class trial_result:
 class strategy_optimizer:
     """
     單策略參數優化器。
-    - 預設使用 Optuna (TPE Bayesian Search)，效率遠高於 random search。
-    - 如 optuna 未安裝，自動退化成 random search。
-    - Walk-forward equity curve 使用鏈式正規化（修正原有斷裂問題）。
+    - 預設使用 Optuna (TPE Bayesian Search)
+    - 如 optuna 未安裝，自動退化成 random search
+    - Walk-forward equity curve 使用鏈式正規化
     """
 
     def __init__(
@@ -74,19 +73,20 @@ class strategy_optimizer:
         self.best_metric: float = -np.inf
 
     # --------------------------------------------------
-    # 預設 cost model
+    # ✅ 修正：config key 統一用 underscore
     # --------------------------------------------------
 
     def _default_cost_model(self) -> TransactionCostModel:
         cfg = loadconfig()
+        bt = cfg.get("backtest", {})
         return TransactionCostModel(
-            commissionrate=cfg["backtest"]["commissionrate"],
-            slippage=cfg["backtest"]["slippage"],
-            mincommission=cfg["backtest"]["mincommission"],
+            commission_rate=bt.get("commission_rate", 0.001),
+            slippage=bt.get("slippage", 0.001),
+            min_commission=bt.get("min_commission", 1.0),
         )
 
     # --------------------------------------------------
-    # 參數 sampling（Optuna trial 物件）
+    # 參數 sampling
     # --------------------------------------------------
 
     def _suggest_params_optuna(self, trial) -> Dict[str, Any]:
@@ -101,12 +101,11 @@ class strategy_optimizer:
                 else:
                     params[key] = trial.suggest_float(key, float(low), float(high))
             else:
-                params[key] = spec  # 固定值（直接 set，不讓 Optuna 搜索）
+                params[key] = spec
         params.update(self.fixed_params)
         return params
 
     def _sample_params_random(self) -> Dict[str, Any]:
-        """Fallback: random search"""
         params: Dict[str, Any] = {}
         for key, spec in self.param_space.items():
             if isinstance(spec, list):
@@ -132,10 +131,10 @@ class strategy_optimizer:
         try:
             strategy = self.strategy_class(**params)
             backtester = UniversalBacktester(
-                initialcapital=self.initial_capital,
-                calendarticker=self.calendar_ticker,
-                allowfractional=self.allow_fractional,
-                costmodel=self.cost_model,
+                initial_capital=self.initial_capital,
+                calendar_ticker=self.calendar_ticker,
+                allow_fractional=self.allow_fractional,
+                cost_model=self.cost_model,
             )
             equity_df = backtester.run(
                 strategy=strategy,
@@ -162,7 +161,6 @@ class strategy_optimizer:
         if not metrics:
             return -np.inf
         val = metrics.get(self.metric, -np.inf)
-        # max_drawdown 越大越差，取負值讓 Optuna maximize
         if self.metric == "max_drawdown":
             return -abs(float(val))
         return float(val)
@@ -174,8 +172,6 @@ class strategy_optimizer:
     def _run_optuna_study(
         self, train_start: str, train_end: str, n_trials: int
     ) -> Tuple[Optional[Dict[str, Any]], float]:
-        """用 Optuna TPE 搜索最優參數"""
-
         def objective(trial):
             params = self._suggest_params_optuna(trial)
             metrics, _ = self._run_single_backtest(params, train_start, train_end)
@@ -188,10 +184,8 @@ class strategy_optimizer:
         study.optimize(objective, n_trials=n_trials, show_progress_bar=False)
 
         best_trial = study.best_trial
-        # 還原固定值（fixed_params 不在 best_params 入面，要補回）
         best_params = dict(best_trial.params)
         best_params.update(self.fixed_params)
-        # 固定值 param（非 list/tuple）亦要補
         for key, spec in self.param_space.items():
             if not isinstance(spec, (list, tuple)):
                 best_params[key] = spec
@@ -200,7 +194,6 @@ class strategy_optimizer:
     def _run_random_search(
         self, train_start: str, train_end: str, n_trials: int
     ) -> Tuple[Optional[Dict[str, Any]], float]:
-        """Fallback: random search"""
         best_metric = -np.inf
         best_params = None
         for _ in range(n_trials):
@@ -264,7 +257,7 @@ class strategy_optimizer:
         return result
 
     # --------------------------------------------------
-    # Walk-Forward 優化（修正 equity chain normalization）
+    # Walk-Forward 優化
     # --------------------------------------------------
 
     def optimize_walk_forward(
@@ -341,7 +334,6 @@ class strategy_optimizer:
             "segments": segments,
         }
 
-        # ✅ 修正：鏈式正規化 equity curve（舊版 pd.concat 會斷裂）
         if all_test_equity:
             chained: List[pd.DataFrame] = []
             running_capital = self.initial_capital
