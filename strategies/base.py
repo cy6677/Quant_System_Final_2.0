@@ -3,6 +3,7 @@ from abc import abstractmethod
 
 from backtest.universal_backtester import BaseStrategy, Order
 
+
 class SwingBase(BaseStrategy):
     def __init__(
         self,
@@ -63,15 +64,18 @@ class SwingBase(BaseStrategy):
             pos["bars"] = pos.get("bars", 0) + 1
 
     def check_common_exits(self, ticker, pos, current_price):
+        """檢查通用出場條件。返回 (orders, should_remove_position)"""
         orders = []
+        should_remove = False
         if pos.get("bars", 0) >= self.max_hold_days:
             entry = pos["entry_price"]
             stop = pos["stop_loss"]
             r_multiple = (current_price - entry) / (entry - stop) if (entry - stop) != 0 else 0
             if r_multiple < 1.0:
                 orders.append(Order(ticker, "MARKET", quantity=-pos.get("shares", 0)))
-                del self.positions[ticker]
-        return orders
+                # ✅ 修正：唔再直接 del，而係標記要移除
+                should_remove = True
+        return orders, should_remove
 
     @abstractmethod
     def generate_signals(self, date, universe_prices, current_portfolio_value):
@@ -79,16 +83,22 @@ class SwingBase(BaseStrategy):
 
     @abstractmethod
     def check_specific_exits(self, ticker, pos, current_price, date, universe_prices):
-        return []
+        """返回 (orders, should_remove_position)"""
+        return [], False
 
-    def on_bar(self, date, universe_prices, current_portfolio_value):
+    # ✅ 修正：on_bar 簽名統一為 5 個參數，兼容 backtester
+    def on_bar(self, date, universe_prices, current_portfolio_value,
+               positions=None, cash=None):
         orders = []
         self.update_positions(date, universe_prices)
 
+        # 設置 stop loss orders
         for ticker, pos in list(self.positions.items()):
             if pos.get("stop_loss") is not None:
                 orders.append(Order(ticker, "STOP_LIMIT", quantity=0, stop_loss=pos["stop_loss"]))
 
+        # 檢查出場
+        tickers_to_remove = []
         for ticker, pos in list(self.positions.items()):
             if ticker not in universe_prices:
                 continue
@@ -97,9 +107,25 @@ class SwingBase(BaseStrategy):
             current_price = df.loc[date, price_col] if date in df.index else None
             if current_price is None or pd.isna(current_price):
                 continue
-            orders.extend(self.check_common_exits(ticker, pos, current_price))
-            orders.extend(self.check_specific_exits(ticker, pos, current_price, date, universe_prices))
 
+            common_orders, common_remove = self.check_common_exits(ticker, pos, current_price)
+            orders.extend(common_orders)
+            if common_remove:
+                tickers_to_remove.append(ticker)
+                continue
+
+            specific_orders, specific_remove = self.check_specific_exits(
+                ticker, pos, current_price, date, universe_prices
+            )
+            orders.extend(specific_orders)
+            if specific_remove:
+                tickers_to_remove.append(ticker)
+
+        # ✅ 修正：統一喺最後先清除 positions（避免 iteration 中 mutation）
+        for ticker in tickers_to_remove:
+            self.positions.pop(ticker, None)
+
+        # 入場
         if len(self.positions) < self.max_positions:
             orders.extend(self.generate_signals(date, universe_prices, current_portfolio_value))
 
