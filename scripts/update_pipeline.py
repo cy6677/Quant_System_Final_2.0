@@ -10,8 +10,9 @@ from config import load_config
 from layers.data_hub import DataHub
 from layers.data_layer import UniverseProvider
 from utils.validation import validate_missing, validate_spikes, validate_spikes_by_ticker
-from utils.Reporting import append_report
+from utils.reporting import append_report
 from utils.logging import get_logger
+
 
 def run_update():
     cfg = load_config()
@@ -74,7 +75,7 @@ def run_update():
     tech.save_unified(processed_dir / "indicators_all.parquet")
     logger.info(f"✅ 指標已儲存至 {processed_dir / 'indicators_all.parquet'}")
 
-    # 7. 嘗試下載基本面 (如果冇 API key 會 fail，但唔影響)
+    # 7. 嘗試下載基本面 (如果沒有 API key 會 fail，但唔影響)
     try:
         hub.fundamentals.download_quarterly(tickers)
     except Exception as e:
@@ -126,6 +127,7 @@ def run_update():
     )
 
     logger.info("✅ Update completed.")
+
 
 if __name__ == "__main__":
     run_update()
