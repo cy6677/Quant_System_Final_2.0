@@ -14,25 +14,11 @@ except ImportError:
 
 
 class regime_detector:
-    """
-    HMM-based Market Regime Detector。
-
-    識別 n_regimes 個隱藏市場狀態（例如：bull / bear / sideways）。
-    每個 regime 對應唔同嘅策略倉位縮放。
-
-    Regime 特徵：
-    - 用日回報 + 波幅（realized vol）作為觀測值
-    - Regime 0 = 最低波幅（通常係 bull market）
-    - Regime n-1 = 最高波幅（通常係 crisis / bear）
-
-    如 hmmlearn 未安裝，退化成簡單嘅 volatility regime。
-    """
-
     def __init__(
         self,
         n_regimes: int = 3,
-        lookback_fit: int = 504,     # 用多少天歷史 fit HMM
-        refit_freq: int = 63,        # 每幾個交易日 re-fit 一次
+        lookback_fit: int = 504,
+        refit_freq: int = 63,
         regime_weights: Optional[Dict[int, float]] = None,
         random_state: int = 42,
     ):
@@ -44,23 +30,17 @@ class regime_detector:
         self._last_fit_date: Optional[pd.Timestamp] = None
         self._fit_counter  = 0
 
-        # 預設：regime 0 = 正常倉位，regime N-1 = 縮倉至 0.5
         if regime_weights is None:
             self.regime_weights = {i: max(0.5, 1.0 - i * 0.25) for i in range(n_regimes)}
         else:
             self.regime_weights = regime_weights
 
     def _build_features(self, returns: pd.Series) -> np.ndarray:
-        """構建 HMM 觀測特徵：[daily return, 5-day realized vol]"""
         vol5 = returns.rolling(5).std().fillna(returns.std())
-        features = np.column_stack([
-            returns.values,
-            vol5.values,
-        ])
+        features = np.column_stack([returns.values, vol5.values])
         return features
 
     def fit(self, spy_prices: pd.Series, asof: Optional[pd.Timestamp] = None) -> bool:
-        """Fit HMM model on historical returns"""
         if not _HMM_AVAILABLE:
             return False
 
@@ -92,10 +72,6 @@ class regime_detector:
         spy_prices: pd.Series,
         asof: Optional[pd.Timestamp] = None,
     ) -> int:
-        """
-        預測當前 regime（0 到 n_regimes-1）。
-        Regime 按波幅由低到高排序：0 = 最穩定，n-1 = 最波動。
-        """
         if self._model is None:
             return self._vol_regime_fallback(spy_prices, asof)
 
@@ -110,7 +86,6 @@ class regime_detector:
             hidden_states = self._model.predict(features)
             current_state = int(hidden_states[-1])
 
-            # 按各 state 嘅 mean vol 重新排序（確保 regime 0 = 最穩定）
             means = self._model.means_
             state_vols = {s: abs(means[s][1]) for s in range(self.n_regimes)}
             sorted_states = sorted(state_vols, key=lambda s: state_vols[s])
@@ -123,7 +98,6 @@ class regime_detector:
     def _vol_regime_fallback(
         self, spy_prices: pd.Series, asof: Optional[pd.Timestamp] = None
     ) -> int:
-        """HMM 不可用時，用 realized vol 判斷 regime"""
         series = spy_prices.loc[:asof] if asof is not None else spy_prices
         returns = series.pct_change().dropna()
         if len(returns) < 20:
@@ -134,11 +108,11 @@ class regime_detector:
         vol_ratio   = current_vol / long_vol if long_vol > 0 else 1.0
 
         if vol_ratio < 0.8:
-            return 0     # 低波幅 → bull
+            return 0
         elif vol_ratio < 1.3:
-            return 1     # 正常
+            return 1
         else:
-            return self.n_regimes - 1  # 高波幅 → bear/crisis
+            return self.n_regimes - 1
 
     def get_position_scale(
         self,
@@ -146,15 +120,6 @@ class regime_detector:
         asof: Optional[pd.Timestamp] = None,
         auto_refit: bool = True,
     ) -> Tuple[int, float]:
-        """
-        返回 (regime, scale_factor)。
-        在策略 on_bar 裡用 scale_factor 縮放倉位大小。
-
-        例如：
-            regime, scale = detector.get_position_scale(spy_prices, date)
-            adjusted_weight = original_weight * scale
-        """
-        # 定期 re-fit
         if auto_refit and _HMM_AVAILABLE:
             self._fit_counter += 1
             if self._fit_counter >= self.refit_freq or self._model is None:
@@ -171,10 +136,6 @@ class regime_detector:
         start_date: str,
         end_date: str,
     ) -> pd.DataFrame:
-        """
-        計算整段歷史每日嘅 regime label。
-        用於 backtest 分析、繪圖。
-        """
         series = spy_prices.loc[start_date:end_date]
         if len(series) < self.lookback_fit:
             self.fit(spy_prices, pd.to_datetime(start_date) + pd.DateOffset(years=2))
