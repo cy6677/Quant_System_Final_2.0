@@ -2,13 +2,11 @@
 """
 萬能回測腳本
 用法：
-    python scripts/run_backtest.py --strategy long      # 只 run LongTerm
-    python scripts/run_backtest.py --strategy a         # 策略 A (原始版)
-    python scripts/run_backtest.py --strategy a_fast    # 策略 A (快速版)
-    python scripts/run_backtest.py --strategy b         # 策略 B
-    python scripts/run_backtest.py --strategy c         # 策略 C
-    python scripts/run_backtest.py --strategy all       # 比較 long, a, b, c
-    唔加參數預設 = long
+    python scripts/run_backtest.py --strategy long
+    python scripts/run_backtest.py --strategy a
+    python scripts/run_backtest.py --strategy b
+    python scripts/run_backtest.py --strategy c
+    python scripts/run_backtest.py --strategy all
 """
 import os
 import sys
@@ -28,8 +26,10 @@ from strategies.strategy_a import StrategyA_VCPBreakout
 from strategies.strategy_b import StrategyB_AVWAPPullback
 from strategies.strategy_c import StrategyC_BollingerReversion
 
+
 def ticker_classifier(ticker: str, extra_etfs: list) -> str:
     return "ETF" if ticker in extra_etfs else "default"
+
 
 def run_single_strategy(
     strategy_class,
@@ -43,42 +43,37 @@ def run_single_strategy(
     benchmark_series=None,
 ) -> dict:
     strategy = strategy_class(**strategy_params)
-    strategy.pipeline = pipeline
+    if hasattr(strategy, "pipeline"):
+        strategy.pipeline = pipeline
 
     backtester = UniversalBacktester(**backtester_params, cost_model=cost_model)
     equity_df = backtester.run(
         strategy=strategy,
-        prices=prices_dict,          # ← 用 prices_dict 呢個參數
+        prices=prices_dict,
         start_date=start_date,
         end_date=end_date,
     )
-
-    analyzer = PerformanceAnalyzer()
-    metrics = analyzer.analyze(equity_df, benchmark_series=benchmark_series)
-    metrics["Strategy"] = strategy.name if hasattr(strategy, "name") else "Strategy"
-    return metrics, equity_df
-
-    # 後面如果仲有 analyzer、metrics，就照你原本 code 保留
-
-
-
-    # 如果策略有統計報告，就印出（唔影響 equity_df）
-    if hasattr(strategy, 'report_stats'):
-        strategy.report_stats()
 
     if equity_df is None or equity_df.empty:
         return {"Error": "No trades"}, equity_df
 
     analyzer = PerformanceAnalyzer()
-    metrics, _ = analyzer.analyze(equity_df, benchmark_prices=benchmark_series)
-    metrics["Trade Count"] = len(backtester.trade_log) // 2
+    metrics = analyzer.analyze(equity_df, benchmark_series=benchmark_series)
+    metrics["Strategy"] = strategy.name if hasattr(strategy, "name") else "Strategy"
+
+    if hasattr(backtester, "trade_log") and not backtester.trade_log.empty:
+        metrics["Trade Count"] = len(backtester.trade_log) // 2
+
     return metrics, equity_df
 
+
 def main():
-    parser = argparse.ArgumentParser(description="萬能回測腳本")
+    parser = argparse.ArgumentParser(description="��能回測腳本")
     parser.add_argument("--strategy", type=str, default="long",
-                        choices=["long", "a", "a_fast", "b", "c", "all"],
-                        help="策略: long / a / a_fast / b / c / all")
+                        choices=["long", "a", "b", "c", "all"],
+                        help="策略: long / a / b / c / all")
+    parser.add_argument("--use-pipeline", action="store_true", default=False,
+                        help="使用完整 pipeline 載入數據（預設用 SPY 測試）")
     args = parser.parse_args()
 
     cfg = load_config()
@@ -87,40 +82,51 @@ def main():
     print("=" * 70)
 
     pipeline = QuantPipeline()
-    print("\n📦 準備 Universe...")
-    cfg = load_config()
 
-    # 簡化測試：只用 SPY，用 yfinance 直接抓數
-    import yfinance as yf
-    print("⚙️ TEST_MODE: 只用 SPY 價格數據做測試")
-    tickers = ["SPY"]
-    data = yf.download(
-        "SPY",
-        start=cfg["data"]["price"]["start_date"],
-        end=cfg["data"]["price"]["end_date"],
-        progress=False,
-    )
-    data = data.rename(columns=str.lower)
-    if "adj close" in data.columns and "close" not in data.columns:
-        data = data.rename(columns={"adj close": "close"})
-    data.index.name = "Date"
-    prices_dict = {"SPY": data}
+    if args.use_pipeline:
+        print("\n📦 使用 Pipeline 準備 Universe...")
+        universe_df, tickers = pipeline.build_universe()
+        pipeline.ensure_prices(tickers)
+        prices_dict = pipeline.load_prices(tickers)
+    else:
+        import yfinance as yf
+        print("⚙️  TEST_MODE: 只用 SPY 價格數據做測試")
+        tickers = ["SPY"]
+        data = yf.download(
+            "SPY",
+            start=cfg["data"]["price"]["start_date"],
+            end=cfg["data"]["price"]["end_date"],
+            progress=False,
+        )
+        # ✅ 修正：確保 column 名用 Title Case
+        if isinstance(data.columns, pd.MultiIndex):
+            data.columns = data.columns.get_level_values(0)
+        col_map = {}
+        for c in data.columns:
+            cl = c.lower().strip()
+            if cl == "open": col_map[c] = "Open"
+            elif cl == "high": col_map[c] = "High"
+            elif cl == "low": col_map[c] = "Low"
+            elif cl in ("close", "adj close"): col_map[c] = "Close"
+            elif cl == "volume": col_map[c] = "Volume"
+            else: col_map[c] = c
+        data = data.rename(columns=col_map)
+        data.index.name = "Date"
+        prices_dict = {"SPY": data}
+        universe_df = pd.DataFrame({"Ticker": tickers})
 
     print(f"✅ Universe: {len(tickers)} 隻股票")
-    print("📥 載入價格數據...")
     print(f"✅ 成功載入 {len(prices_dict)} 隻股票")
-
 
     start_date = cfg["data"]["price"]["start_date"] or "2015-01-01"
     end_date = cfg["data"]["price"]["end_date"] or datetime.now().strftime("%Y-%m-%d")
 
-    cost_cfg = cfg.get("cost_model", {})
     extra_etfs = cfg["universe"].get("extra_etfs", [])
     cost_model = TransactionCostModel(
         commission_rate=cfg["backtest"]["commission_rate"],
         slippage=cfg["backtest"]["slippage"],
         min_commission=cfg["backtest"]["min_commission"],
-        per_ticker_costs=cost_cfg,
+        per_ticker_costs=cfg.get("cost_model", {}),
         ticker_classifier=lambda t: ticker_classifier(t, extra_etfs)
     )
 
@@ -128,11 +134,14 @@ def main():
         "initial_capital": cfg["backtest"]["initial_capital"],
         "calendar_ticker": cfg["backtest"]["calendar_ticker"],
         "allow_fractional": cfg["backtest"]["allow_fractional"],
-        "min_trade_value": 5.0,
     }
 
-    benchmark = price_data.get("SPY")
-    bench_series = benchmark["Close"] if benchmark is not None else None
+    # ✅ 修正：用 prices_dict 取 benchmark
+    benchmark = prices_dict.get("SPY")
+    bench_series = None
+    if benchmark is not None:
+        close_col = "Close" if "Close" in benchmark.columns else "close"
+        bench_series = benchmark[close_col]
 
     strategies = {
         "long": {
@@ -146,12 +155,12 @@ def main():
             },
         },
         "a": {
-            "name": "Strategy A - VCP Breakout (Original)",
+            "name": "Strategy A - VCP Breakout",
             "class": StrategyA_VCPBreakout,
             "params": {
-                "risk_per_trade": 0.005,
-                "min_price": 5.0,
-                "min_avg_dollar_vol": 20e6,
+                "riskpertrade": 0.005,
+                "minprice": 5.0,
+                "minavgdollarvol": 20e6,
                 "max_hold_days": 30,
                 "atr_short": 5,
                 "atr_long": 20,
@@ -164,14 +173,10 @@ def main():
                 "trail_atr": 3.0,
             },
         },
-
         "b": {
             "name": "Strategy B - AVWAP Pullback",
             "class": StrategyB_AVWAPPullback,
             "params": {
-                "risk_per_trade": 0.005,
-                "min_price": 5.0,
-                "min_avg_dollar_vol": 20e6,
                 "max_hold_days": 20,
                 "anchor_type": "maxvolume",
                 "avwap_touch_pct": 0.25,
@@ -188,9 +193,6 @@ def main():
             "name": "Strategy C - Bollinger Reversion",
             "class": StrategyC_BollingerReversion,
             "params": {
-                "risk_per_trade": 0.005,
-                "min_price": 5.0,
-                "min_avg_dollar_vol": 20e6,
                 "max_hold_days": 5,
                 "bb_period": 20,
                 "bb_std": 2,
@@ -204,15 +206,14 @@ def main():
 
     if args.strategy == "all":
         results = []
-        compare = ["long", "a", "b", "c"]
-        for key in compare:
+        for key in ["long", "a", "b", "c"]:
             s = strategies[key]
             print(f"\n▶️ 執行: {s['name']}")
             try:
                 metrics, _ = run_single_strategy(
                     strategy_class=s["class"],
                     strategy_params=s["params"],
-                    prices_dict=price_data,
+                    prices_dict=prices_dict,
                     start_date=start_date,
                     end_date=end_date,
                     backtester_params=backtester_params,
@@ -222,7 +223,9 @@ def main():
                 )
                 metrics["Strategy"] = s["name"]
                 results.append(metrics)
-                print(f"   ✅ CAGR: {metrics.get('CAGR', 0):.2%} | Sharpe: {metrics.get('Sharpe', 0):.2f} | MaxDD: {metrics.get('Max Drawdown', 0):.2%}")
+                print(f"   ✅ CAGR: {metrics.get('CAGR', 0):.2%} | "
+                      f"Sharpe: {metrics.get('Sharpe', 0):.2f} | "
+                      f"MaxDD: {metrics.get('Max Drawdown', 0):.2%}")
             except Exception as e:
                 print(f"   ❌ 失敗: {e}")
                 results.append({"Strategy": s["name"], "Error": str(e)})
@@ -241,7 +244,7 @@ def main():
         metrics, equity_df = run_single_strategy(
             strategy_class=s["class"],
             strategy_params=s["params"],
-            prices_dict=price_data,
+            prices_dict=prices_dict,
             start_date=start_date,
             end_date=end_date,
             backtester_params=backtester_params,
@@ -266,8 +269,9 @@ def main():
             print(f"Beta: {metrics['Beta']:.2f}")
 
         out_name = f"backtest_{args.strategy}.csv"
-        equity_df.to_csv(out_name, index=False)
+        equity_df.to_csv(out_name)
         print(f"\n💾 權益曲線已儲存至: {out_name}")
+
 
 if __name__ == "__main__":
     main()
