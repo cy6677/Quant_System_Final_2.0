@@ -25,11 +25,11 @@
             "end_date": "2024-12-31"
         },
         "fundamentals": {
-            "api_key": "438de359-d321-4ce9-8333-7cdc02afd711",
+            "api_key": "",
             "mapping_file": "data/simfin_mapping.csv"
         },
         "macro": {
-            "fred_api_key": "bfb862bc5a50a326c37e497374962f36"
+            "fred_api_key": ""
         }
     },
     "backtest": {
@@ -47,3 +47,4 @@
         "use_clean_universe": true
     }
 }
+
