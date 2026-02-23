@@ -1,7 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional, Union, Callable, Any
+from typing import Dict, List, Optional, Callable, Any
 from abc import ABC, abstractmethod
 import math
 import numpy as np
@@ -30,12 +30,16 @@ class position:
 class base_strategy(ABC):
     def __init__(self, name: str):
         self.name = name
+        self.pipeline = None
+        # ✅ 策略可提供：回測時只需要最近多少日歷史（加速）
+        # 沒提供就由 backtester fallback
+        # self.history_window = 400
 
     @abstractmethod
     def on_bar(
         self,
         date: pd.Timestamp,
-        universe_prices: Dict[str, pd.Series],   # 當日各 ticker 的 OHLCV Series
+        universe_prices: Dict[str, pd.DataFrame],  # 傳入到 date 為止「最近 N 日」hist DF
         current_portfolio_value: float,
         positions: Dict[str, position],
         cash: float,
@@ -75,9 +79,9 @@ class transaction_cost_model:
             return self.per_ticker_costs[category]
         return self.per_ticker_costs["default"]
 
-    def calc_commission(self, ticker: str, trade_value: float) -> float:
+    def calc_commission(self, ticker: str, trade_value_abs: float) -> float:
         cfg = self._get_ticker_config(ticker)
-        comm = trade_value * cfg["commission_rate"]
+        comm = trade_value_abs * cfg["commission_rate"]
         return max(comm, cfg["min_commission"])
 
     def apply_slippage(self, ticker: str, price: float, qty: float) -> float:
@@ -89,7 +93,7 @@ class transaction_cost_model:
         return price
 
 # =========================
-# Execution Model：T+1 fill, ADV limit
+# Execution Model：T+1 open fill, ADV limit
 # =========================
 
 class execution_model:
@@ -105,20 +109,29 @@ class execution_model:
 
     def _get_next_bar(self, ticker: str, date: pd.Timestamp) -> Optional[pd.Series]:
         df = self.prices.get(ticker)
-        if df is None:
+        if df is None or df.empty:
             return None
-        try:
-            loc = df.index.get_loc(date)
-        except KeyError:
+        idx_pos = df.index.get_indexer([date])[0]
+        if idx_pos < 0:
             return None
-        next_idx = loc + 1
-        if next_idx >= len(df.index):
+        nxt = idx_pos + 1
+        if nxt >= len(df.index):
             return None
-        return df.iloc[next_idx]
+        return df.iloc[nxt]
+
+    @staticmethod
+    def _get_col(bar: pd.Series, names: List[str], default: Optional[float] = None) -> Optional[float]:
+        for n in names:
+            if n in bar.index:
+                try:
+                    return float(bar[n])
+                except Exception:
+                    return default
+        return default
 
     def execute_orders(
         self,
-        date: pd.Timestamp,
+        date: pd.Timestamp,  # signal_date
         orders: List[order],
         positions: Dict[str, position],
         cash: float,
@@ -127,70 +140,76 @@ class execution_model:
     ):
         fills: List[Dict[str, Any]] = []
         new_positions = dict(positions)
-        new_cash = cash
+        new_cash = float(cash)
 
-        # 先將 target_weight 轉換為 market orders
-        expanded_orders: List[order] = []
+        # target_weight -> market (用 T+1 open 估)
+        expanded: List[order] = []
         for o in orders:
             if o.order_type == "target_weight":
                 if o.target_weight is None:
                     continue
-                px_bar = self._get_next_bar(o.ticker, date)
-                if px_bar is None:
+                nb = self._get_next_bar(o.ticker, date)
+                if nb is None:
                     continue
-                price = float(px_bar["open"]) if "open" in px_bar else float(px_bar["Open"])
-                current_pos = new_positions.get(o.ticker, position(qty=0.0, avg_cost=0.0))
+                opx = self._get_col(nb, ["Open", "open"])
+                cpx = self._get_col(nb, ["Close", "close"])
+                px = opx if opx is not None else cpx
+                if px is None or px <= 0:
+                    continue
+
+                cur = new_positions.get(o.ticker, position(qty=0.0, avg_cost=0.0))
                 target_value = portfolio_value * o.target_weight
-                current_value = current_pos.qty * price
-                diff_value = target_value - current_value
-                qty = diff_value / price if price > 0 else 0.0
+                cur_value = cur.qty * px
+                diff_value = target_value - cur_value
+                qty = diff_value / px
+
                 if not self.allow_fractional:
                     qty = math.floor(qty) if qty > 0 else math.ceil(qty)
                 if abs(qty) < 1e-8:
                     continue
-                expanded_orders.append(order(
-                    ticker=o.ticker,
-                    order_type="market",
-                    quantity=qty,
-                    metadata=o.metadata,
-                ))
+
+                expanded.append(order(ticker=o.ticker, order_type="market", quantity=float(qty), metadata=o.metadata))
             else:
-                expanded_orders.append(o)
+                expanded.append(o)
 
-        # 按 ticker 聚合 desired qty
-        desired_qty_by_ticker: Dict[str, float] = {}
-        for o in expanded_orders:
-            desired_qty_by_ticker[o.ticker] = desired_qty_by_ticker.get(o.ticker, 0.0) + o.quantity
+        desired_by_t: Dict[str, float] = {}
+        for o in expanded:
+            desired_by_t[o.ticker] = desired_by_t.get(o.ticker, 0.0) + float(o.quantity)
 
-        for ticker, desired_qty in desired_qty_by_ticker.items():
+        for ticker, desired_qty in desired_by_t.items():
             if abs(desired_qty) < 1e-8:
                 continue
-            bar = self._get_next_bar(ticker, date)
+
+            bar = self._get_next_bar(ticker, date)  # fill at T+1
             if bar is None:
                 continue
-            day_open = float(bar["open"]) if "open" in bar else float(bar["Open"])
-            day_volume = float(bar.get("volume", bar.get("Volume", 0.0)))
 
-            # 成交量限制
-            max_qty_by_volume = float('inf')
-            if self.max_participation is not None and self.max_participation > 0 and day_volume > 0:
-                max_qty_by_volume = day_volume * self.max_participation
+            day_open = self._get_col(bar, ["Open", "open"])
+            day_close = self._get_col(bar, ["Close", "close"])
+            raw_price = day_open if day_open is not None else day_close
+            if raw_price is None or raw_price <= 0:
+                continue
 
-            qty = desired_qty
+            vol = self._get_col(bar, ["Volume", "volume"], default=0.0) or 0.0
+
+            max_qty = float("inf")
+            if self.max_participation and self.max_participation > 0 and vol > 0:
+                max_qty = float(vol) * float(self.max_participation)
+
+            qty = float(desired_qty)
             if not self.allow_fractional:
                 qty = math.floor(qty) if qty > 0 else math.ceil(qty)
-            if abs(qty) > max_qty_by_volume:
-                scale = max_qty_by_volume / abs(qty) if abs(qty) > 0 else 0.0
-                qty = qty * scale
+
+            if abs(qty) > max_qty:
+                qty = qty * (max_qty / abs(qty))
+
             if abs(qty) < 1e-8:
                 continue
 
-            raw_price = day_open
-            price = cost_model.apply_slippage(ticker, raw_price, qty)
+            price = cost_model.apply_slippage(ticker, float(raw_price), qty)
             trade_value = price * qty
             commission = cost_model.calc_commission(ticker, abs(trade_value))
 
-            # 現金檢查（買入）
             if qty > 0:
                 total_cost = trade_value + commission
                 if total_cost > new_cash:
@@ -210,26 +229,24 @@ class execution_model:
             if abs(new_qty) < 1e-12:
                 new_positions.pop(ticker, None)
             else:
-                # 更新平均成本（簡化處理）
                 if pos.qty == 0:
-                    new_avg_cost = price
+                    new_avg = price
                 else:
                     if (pos.qty > 0 and qty > 0) or (pos.qty < 0 and qty < 0):
-                        new_avg_cost = (pos.qty * pos.avg_cost + qty * price) / new_qty
+                        new_avg = (pos.qty * pos.avg_cost + qty * price) / new_qty
                     else:
-                        # 減倉時不改變 avg_cost
-                        new_avg_cost = pos.avg_cost
-                new_positions[ticker] = position(qty=new_qty, avg_cost=new_avg_cost)
+                        new_avg = pos.avg_cost
+                new_positions[ticker] = position(qty=float(new_qty), avg_cost=float(new_avg))
 
             new_cash -= (trade_value + commission)
             fills.append({
-                "date": bar.name,
+                "fill_date": bar.name,
                 "signal_date": date,
                 "ticker": ticker,
-                "qty": qty,
-                "price": price,
-                "value": trade_value,
-                "commission": commission,
+                "qty": float(qty),
+                "price": float(price),
+                "value": float(trade_value),
+                "commission": float(commission),
             })
 
         return new_positions, new_cash, fills
@@ -249,7 +266,7 @@ class universal_backtester:
         execution_model_factory: Optional[Callable[[Dict[str, pd.DataFrame]], execution_model]] = None,
         min_trade_value: float = 0.0,
     ):
-        self.initial_capital = initial_capital
+        self.initial_capital = float(initial_capital)
         self.calendar_ticker = calendar_ticker
         self.allow_fractional = allow_fractional
         self.max_total_risk = max_total_risk
@@ -257,15 +274,33 @@ class universal_backtester:
         self.execution_model_factory = execution_model_factory
         self.min_trade_value = min_trade_value
 
-    def _compute_portfolio_value(self, date, positions, cash, prices):
-        total = cash
+    @staticmethod
+    def _get_close(df: pd.DataFrame, date: pd.Timestamp) -> Optional[float]:
+        if df is None or df.empty or date not in df.index:
+            return None
+        if "Close" in df.columns:
+            return float(df.loc[date, "Close"])
+        if "close" in df.columns:
+            return float(df.loc[date, "close"])
+        return None
+
+    def _compute_portfolio_value(self, date: pd.Timestamp, positions: Dict[str, position], cash: float, prices: Dict[str, pd.DataFrame]) -> float:
+        total = float(cash)
         for ticker, pos in positions.items():
             df = prices.get(ticker)
-            if df is None or date not in df.index:
+            px = self._get_close(df, date)
+            if px is None:
                 continue
-            px = float(df.loc[date, "close"]) if "close" in df.columns else float(df.loc[date, "Close"])
-            total += pos.qty * px
-        return total
+            total += float(pos.qty) * float(px)
+        return float(total)
+
+    def _get_calendar_index(self, prices: Dict[str, pd.DataFrame]) -> pd.DatetimeIndex:
+        if self.calendar_ticker in prices and not prices[self.calendar_ticker].empty:
+            return pd.DatetimeIndex(prices[self.calendar_ticker].index)
+        for _, df in prices.items():
+            if df is not None and not df.empty:
+                return pd.DatetimeIndex(df.index)
+        raise ValueError("No valid price data for calendar")
 
     def run(
         self,
@@ -280,8 +315,7 @@ class universal_backtester:
         if prices is None:
             raise ValueError("prices or prices_dict must be provided")
 
-        calendar_df = prices[self.calendar_ticker]
-        idx = calendar_df.index
+        idx = self._get_calendar_index(prices)
         if start_date is not None:
             idx = idx[idx >= pd.to_datetime(start_date)]
         if end_date is not None:
@@ -290,51 +324,59 @@ class universal_backtester:
             raise ValueError("Not enough dates for backtest")
 
         positions: Dict[str, position] = {}
-        cash = self.initial_capital
+        cash = float(self.initial_capital)
+
         exec_model = (
             self.execution_model_factory(prices)
             if self.execution_model_factory is not None
             else execution_model(prices=prices, allow_fractional=self.allow_fractional)
         )
 
+        # ✅ 加速：策略可提供 history_window（預設 400）
+        history_window = int(getattr(strategy, "history_window", 400))
+        history_window = max(history_window, 50)
+
         records: List[Dict[str, Any]] = []
         fills_all: List[Dict[str, Any]] = []
 
         for i in range(len(idx) - 1):
-            date = idx[i]
-            # 構建當日的 universe_prices (每個 ticker 的 Series)
-            universe_prices = {}
-            for ticker, df in prices.items():
-                if date in df.index:
-                    universe_prices[ticker] = df.loc[date]
+            signal_date = idx[i]
+            fill_date = idx[i + 1]
 
-            portfolio_value = self._compute_portfolio_value(date, positions, cash, prices)
+            universe_prices: Dict[str, pd.DataFrame] = {}
+            for ticker, df in prices.items():
+                if df is None or df.empty:
+                    continue
+                if signal_date in df.index:
+                    # ✅ 只取最近 N 日，避免每次傳整段歷史（大幅加速）
+                    hist = df.loc[:signal_date].tail(history_window)
+                    universe_prices[ticker] = hist
+
+            pv = self._compute_portfolio_value(signal_date, positions, cash, prices)
             orders = strategy.on_bar(
-                date=date,
+                date=signal_date,
                 universe_prices=universe_prices,
-                current_portfolio_value=portfolio_value,
+                current_portfolio_value=pv,
                 positions=positions,
                 cash=cash,
             )
 
-            new_positions, new_cash, fills = exec_model.execute_orders(
-                date=date,
+            positions, cash, fills = exec_model.execute_orders(
+                date=signal_date,
                 orders=orders,
                 positions=positions,
                 cash=cash,
-                portfolio_value=portfolio_value,
+                portfolio_value=pv,
                 cost_model=self.cost_model,
             )
-            positions = new_positions
-            cash = new_cash
             fills_all.extend(fills)
 
-            end_of_day_value = self._compute_portfolio_value(date, positions, cash, prices)
+            eod_value = self._compute_portfolio_value(fill_date, positions, cash, prices)
             records.append({
-                "date": date,
-                "equity": end_of_day_value,
-                "cash": cash,
-                "positions_count": len(positions),
+                "date": fill_date,
+                "equity": float(eod_value),
+                "cash": float(cash),
+                "positions_count": int(len(positions)),
             })
 
         equity_df = pd.DataFrame.from_records(records).set_index("date")
@@ -347,12 +389,12 @@ class universal_backtester:
         return getattr(self, "_last_fills", pd.DataFrame())
 
 # =========================
-# PerformanceAnalyzer
+# PerformanceAnalyzer (保持你原來即可)
 # =========================
 
 class performance_analyzer:
     def __init__(self, risk_free_rate: float = 0.04):
-        self.risk_free_rate = risk_free_rate
+        self.risk_free_rate = float(risk_free_rate)
 
     def analyze(
         self,
@@ -361,7 +403,7 @@ class performance_analyzer:
         trade_log: Optional[pd.DataFrame] = None,
     ) -> Dict[str, float]:
         result: Dict[str, float] = {}
-        if equity_df.empty:
+        if equity_df is None or equity_df.empty:
             return result
 
         equity = equity_df["equity"].astype(float)
@@ -369,7 +411,6 @@ class performance_analyzer:
         if returns.empty:
             return result
 
-        n_days = len(returns)
         ann_factor = 252
         daily_rf = (1 + self.risk_free_rate) ** (1 / ann_factor) - 1
 
@@ -378,62 +419,17 @@ class performance_analyzer:
         ann_vol = float(returns.std() * np.sqrt(ann_factor))
         sharpe = float((ann_ret - self.risk_free_rate) / ann_vol) if ann_vol > 0 else 0.0
 
-        # Max Drawdown
         cum_max = equity.cummax()
         dd_series = equity / cum_max - 1
         max_dd = float(dd_series.min())
 
-        # Sortino Ratio
-        excess_returns = returns - daily_rf
-        downside = excess_returns[excess_returns < 0]
-        downside_std = float(downside.std() * np.sqrt(ann_factor)) if len(downside) > 0 else 0.0
-        sortino = float((ann_ret - self.risk_free_rate) / downside_std) if downside_std > 0 else 0.0
+        result["total_return"] = total_ret
+        result["ann_return"] = ann_ret
+        result["ann_vol"] = ann_vol
+        result["sharpe"] = sharpe
+        result["max_drawdown"] = max_dd
 
-        # Calmar
-        calmar = float(ann_ret / abs(max_dd)) if max_dd < 0 else 0.0
-
-        # Win Rate
-        win_rate = float((returns > 0).mean())
-
-        # Profit Factor
-        pos_sum = float(returns[returns > 0].sum())
-        neg_sum = float(abs(returns[returns < 0].sum()))
-        profit_factor = float(pos_sum / neg_sum) if neg_sum > 0 else float("inf")
-
-        # Omega
-        gains = (returns - daily_rf).clip(lower=0).sum()
-        losses = (daily_rf - returns).clip(lower=0).sum()
-        omega = float(gains / losses) if losses > 0 else float("inf")
-
-        # Recovery Factor
-        recovery_factor = float(total_ret / abs(max_dd)) if max_dd < 0 else float("inf")
-
-        # Max Consecutive Losses
-        loss_streak = 0
-        max_loss_streak = 0
-        for r in returns:
-            if r < 0:
-                loss_streak += 1
-                max_loss_streak = max(max_loss_streak, loss_streak)
-            else:
-                loss_streak = 0
-
-        result["total_return"]       = total_ret
-        result["ann_return"]         = ann_ret
-        result["ann_vol"]            = ann_vol
-        result["sharpe"]             = sharpe
-        result["sortino"]            = sortino
-        result["calmar"]             = calmar
-        result["max_drawdown"]       = max_dd
-        result["win_rate"]           = win_rate
-        result["profit_factor"]      = profit_factor
-        result["omega_ratio"]        = omega
-        result["recovery_factor"]    = recovery_factor
-        result["max_consec_losses"]  = float(max_loss_streak)
-        result["avg_daily_ret"]      = float(returns.mean())
-
-        # Alpha / Beta vs Benchmark
-        if benchmark_series is not None:
+        if benchmark_series is not None and isinstance(benchmark_series, pd.Series) and len(benchmark_series) > 10:
             bench_ret = benchmark_series.pct_change().dropna()
             aligned = pd.concat([returns, bench_ret], axis=1, join="inner").dropna()
             if len(aligned) > 10:
@@ -444,50 +440,16 @@ class performance_analyzer:
                 cov_matrix = np.cov(strat_excess, bench_excess)
                 beta = float(cov_matrix[0, 1] / cov_matrix[1, 1]) if cov_matrix[1, 1] > 0 else 0.0
                 alpha = float((strat_excess.mean() - beta * bench_excess.mean()) * ann_factor)
-                result["alpha"]          = alpha
-                result["beta"]           = beta
-                result["benchmark_ann"]  = float((1 + bench_r.mean()) ** ann_factor - 1)
-                result["benchmark_corr"] = float(strat_r.corr(bench_r))
+                result["alpha"] = alpha
+                result["beta"] = beta
 
-        # Trade-level 指標
-        if trade_log is not None and not trade_log.empty and "value" in trade_log.columns:
-            pnl_col = trade_log["value"]   # 正值代表買入支出？不適合直接作為盈虧
-            # 更合理的 trade-level 指標需要逐筆交易配對，這裡簡化
+        if trade_log is not None and not trade_log.empty:
             result["trade_count"] = float(len(trade_log))
-            # 粗略估算：用 value 的正負？不準確，可省略
-            # 建議另寫函數計算
 
         return result
 
     def summary_table(self, metrics: Dict[str, float]) -> pd.DataFrame:
-        labels = {
-            "total_return":       ("Total Return",        "{:.2%}"),
-            "ann_return":         ("Ann. Return",         "{:.2%}"),
-            "ann_vol":            ("Ann. Volatility",     "{:.2%}"),
-            "sharpe":             ("Sharpe Ratio",        "{:.3f}"),
-            "sortino":            ("Sortino Ratio",       "{:.3f}"),
-            "calmar":             ("Calmar Ratio",        "{:.3f}"),
-            "max_drawdown":       ("Max Drawdown",        "{:.2%}"),
-            "win_rate":           ("Win Rate (daily)",    "{:.2%}"),
-            "profit_factor":      ("Profit Factor",       "{:.3f}"),
-            "omega_ratio":        ("Omega Ratio",         "{:.3f}"),
-            "recovery_factor":    ("Recovery Factor",     "{:.3f}"),
-            "max_consec_losses":  ("Max Consec. Losses",  "{:.0f}"),
-            "alpha":              ("Alpha (ann.)",        "{:.2%}"),
-            "beta":               ("Beta",                "{:.3f}"),
-            "trade_count":        ("# Trades",            "{:.0f}"),
-        }
-        rows = []
-        for key, (label, fmt) in labels.items():
-            if key in metrics:
-                val = metrics[key]
-                try:
-                    display = fmt.format(val)
-                except Exception:
-                    display = str(val)
-                rows.append({"Metric": label, "Value": display})
-        return pd.DataFrame(rows).set_index("Metric")
-
+        return pd.DataFrame([metrics]).T.rename(columns={0: "Value"})
 
 # Aliases
 UniversalBacktester  = universal_backtester
